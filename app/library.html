@@ -3426,7 +3426,20 @@ https://jannyai.com/characters/uuid_slug
                                 <span class="settings-hint"><i class="fa-solid fa-hand-point-right"></i> Unmatched images remain in the original folder for manual handling.</span>
                             </div>
                         </div>
-                        
+
+                        <div class="settings-group">
+                            <div class="settings-group-title"><i class="fa-solid fa-link"></i> Step 3: Fix Chat Links</div>
+                            <span class="settings-hint">Moving images out of a character's old folder leaves chat messages that attached those images (AI-generated inline images, Stable Diffusion output, manually attached files, etc.) pointing at the old, now-empty location — on either side of the conversation. This scans chats for messages whose attached image no longer exists in its recorded folder but does exist under the character's current folder, and repoints them.</span>
+                            <div class="settings-row" style="margin-top: 8px;">
+                                <button id="fixChatMediaLinksBtn" class="settings-action-btn">
+                                    <i class="fa-solid fa-link"></i> Fix Chat Links
+                                </button>
+                            </div>
+                            <div class="settings-row" id="fixChatMediaLinksStatus" style="display: none;">
+                                <span class="settings-hint" id="fixChatMediaLinksStatusText" style="color: var(--accent);"></span>
+                            </div>
+                        </div>
+
                         <div class="settings-group">
                             <div class="settings-group-title"><i class="fa-solid fa-map"></i> Reference</div>
                             <div class="settings-row">

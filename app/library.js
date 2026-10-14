@@ -5517,7 +5517,72 @@ function setupSettingsModal() {
             debugLog('[MigrateAll] Summary:', { totalMoved, totalErrors, charsProcessed, charsWithImages });
         };
     }
-    
+
+    // Fix Chat Links button handler
+    const fixChatMediaLinksBtn = document.getElementById('fixChatMediaLinksBtn');
+    const fixChatMediaLinksStatus = document.getElementById('fixChatMediaLinksStatus');
+    const fixChatMediaLinksStatusText = document.getElementById('fixChatMediaLinksStatusText');
+
+    if (fixChatMediaLinksBtn) {
+        fixChatMediaLinksBtn.onclick = async () => {
+            if (!getSetting('uniqueGalleryFolders')) {
+                showToast('Enable "Unique Gallery Folders" first before fixing chat links.', 'error');
+                return;
+            }
+            if (window.extensionsRecoveryInProgress) {
+                showToast('Character data is still loading — please wait', 'warning');
+                return;
+            }
+
+            const confirmed = confirm(
+                `Fix Chat Links\n\n` +
+                `This scans every chat for every character with a gallery ID, looking for messages (from either ` +
+                `side of the conversation) whose attached image no longer exists in its recorded folder but does ` +
+                `exist in that character's current gallery folder, and repoints the link.\n\n` +
+                `A link is only rewritten when the old path is confirmed missing and the new one confirmed present, ` +
+                `so images that were never moved are left alone.\n\n` +
+                `This can take a while on large chat histories. Continue?`
+            );
+            if (!confirmed) return;
+
+            const originalText = fixChatMediaLinksBtn.innerHTML;
+            fixChatMediaLinksBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Scanning...';
+            fixChatMediaLinksBtn.disabled = true;
+            if (fixChatMediaLinksStatus) fixChatMediaLinksStatus.style.display = 'block';
+
+            let result;
+            try {
+                result = await fixChatMediaLinksForUniqueFolders({
+                    onProgress: ({ character, chat, charIndex, charTotal }) => {
+                        if (fixChatMediaLinksStatusText) {
+                            fixChatMediaLinksStatusText.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Scanning ${escapeHtml(character)} (${charIndex}/${charTotal})... "${escapeHtml(chat)}"`;
+                        }
+                    },
+                });
+            } catch (error) {
+                console.error('[FixChatLinks] Unexpected error:', error);
+                result = { charactersScanned: 0, chatsScanned: 0, chatsFixed: 0, linksFixed: 0, errors: [{ character: '-', error: error.message }] };
+            }
+
+            fixChatMediaLinksBtn.innerHTML = originalText;
+            fixChatMediaLinksBtn.disabled = false;
+
+            const { chatsScanned, chatsFixed, linksFixed, errors } = result;
+            if (fixChatMediaLinksStatusText) {
+                fixChatMediaLinksStatusText.innerHTML = `<i class="fa-solid fa-check"></i> Scanned ${chatsScanned} chat(s): ${linksFixed} link(s) fixed in ${chatsFixed} chat(s).${errors.length > 0 ? ` ${errors.length} error(s), check console.` : ''}`;
+            }
+            if (errors.length > 0) {
+                console.warn('[FixChatLinks] Errors:', errors);
+            }
+
+            const message = `Fixed ${linksFixed} chat link(s) across ${chatsFixed} chat(s)` +
+                (errors.length > 0 ? ` (${errors.length} errors)` : '');
+            showToast(message, errors.length === 0 ? 'success' : 'error');
+
+            debugLog('[FixChatLinks] Summary:', result);
+        };
+    }
+
     // View Folder Mapping button handler
     const viewFolderMappingBtn = document.getElementById('viewFolderMappingBtn');
     if (viewFolderMappingBtn) {
@@ -8202,7 +8267,180 @@ async function migrateCharacterImagesToUniqueFolder(char) {
         debugError(`[MigrateAll] Error migrating ${char.name}:`, error);
         result.errors++;
     }
-    
+
+    return result;
+}
+
+/**
+ * Parse a same-origin `/user/images/<folder>/<file>` URL into its parts.
+ * Returns null for anything else (external URLs, data URIs, non-image API paths).
+ * @param {string} url
+ * @returns {{ folder: string, fileName: string } | null}
+ */
+function parseLocalGalleryImageUrl(url) {
+    if (typeof url !== 'string') return null;
+    const match = url.match(/^\/user\/images\/([^/]+)\/([^/?#]+)/);
+    if (!match) return null;
+    try {
+        return { folder: decodeURIComponent(match[1]), fileName: decodeURIComponent(match[2]) };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Repoints chat-attached media (extra.media[], legacy extra.image, and their per-swipe
+ * copies in swipe_info[].extra) that still point at a character's pre-migration gallery
+ * folder after "Unique Gallery Folders" moved the files out from under them.
+ *
+ * Every message in the chat is scanned, regardless of who sent it: SillyTavern's manual
+ * attach-a-file flow (drag/drop, paste, file picker before sending) saves under the
+ * currently active *character's* folder unconditionally, even for messages that end up
+ * flagged is_user — only the separate "model returned an inline image" path keys off the
+ * speaking party, and that path only ever produces character messages. So a stale link can
+ * show up on a user message too. A link is only rewritten when the same filename is
+ * confirmed present in the character's current gallery folder AND confirmed absent from
+ * the referenced folder, so a same-named file that legitimately still lives in both places
+ * is left alone — that dual check, not the message's author, is what keeps this safe.
+ * Single-character chats only; group chats are out of scope (a group message's folder is
+ * whichever member spoke, not a single character's gallery).
+ *
+ * @param {object} [options]
+ * @param {(info: { character: string, chat: string, charIndex: number, charTotal: number }) => void} [options.onProgress]
+ * @returns {Promise<{ charactersScanned: number, chatsScanned: number, chatsFixed: number, linksFixed: number, errors: Array<{ character: string, chat?: string, error: string }> }>}
+ */
+async function fixChatMediaLinksForUniqueFolders(options = {}) {
+    const { onProgress } = options;
+    const result = { charactersScanned: 0, chatsScanned: 0, chatsFixed: 0, linksFixed: 0, errors: [] };
+
+    if (!getSetting('uniqueGalleryFolders')) {
+        return result;
+    }
+
+    // Only characters with a gallery_id could ever have had files migrated out of their
+    // plain-name folder, so only they can have stale links to repair.
+    const candidates = allCharacters.filter(c => extensionsReady(c) && getCharacterGalleryId(c));
+
+    // Folder file-name listings are fetched once per distinct folder per run and reused
+    // across every chat/message that references that folder.
+    const folderFileCache = new Map();
+    function listFolderFiles(folderName) {
+        if (!folderName) return Promise.resolve(new Set());
+        if (folderFileCache.has(folderName)) return folderFileCache.get(folderName);
+        const promise = (async () => {
+            try {
+                const resp = await apiRequest(ENDPOINTS.IMAGES_LIST, 'POST', { folder: folderName, type: 7 });
+                if (!resp.ok) return new Set();
+                const files = await resp.json();
+                return new Set((files || []).map(f => (typeof f === 'string' ? f : f?.name)).filter(Boolean));
+            } catch {
+                return new Set();
+            }
+        })();
+        folderFileCache.set(folderName, promise);
+        return promise;
+    }
+
+    for (let i = 0; i < candidates.length; i++) {
+        const char = candidates[i];
+        result.charactersScanned++;
+        const currentFolder = getGalleryFolderName(char);
+        if (!currentFolder) continue;
+
+        let chats;
+        try {
+            const resp = await apiRequest(ENDPOINTS.CHARACTERS_CHATS, 'POST', { avatar_url: char.avatar });
+            if (!resp.ok) continue;
+            chats = await resp.json();
+        } catch (error) {
+            result.errors.push({ character: char.name, error: error.message });
+            continue;
+        }
+        if (!Array.isArray(chats) || chats.length === 0) continue;
+
+        for (const chatMeta of chats) {
+            const fileName = (chatMeta?.file_name || '').replace(/\.jsonl$/, '');
+            if (!fileName) continue;
+            result.chatsScanned++;
+
+            onProgress?.({ character: char.name, chat: fileName, charIndex: i + 1, charTotal: candidates.length });
+
+            let messages;
+            try {
+                const resp = await apiRequest(ENDPOINTS.CHATS_GET, 'POST', {
+                    ch_name: char.name,
+                    file_name: fileName,
+                    avatar_url: char.avatar,
+                });
+                if (!resp.ok) continue;
+                messages = await resp.json();
+            } catch (error) {
+                result.errors.push({ character: char.name, chat: fileName, error: error.message });
+                continue;
+            }
+            if (!Array.isArray(messages) || messages.length === 0) continue;
+
+            let chatLinksFixed = 0;
+
+            const maybeFixField = async (obj, key) => {
+                const parsed = parseLocalGalleryImageUrl(obj?.[key]);
+                if (!parsed || parsed.folder === currentFolder) return;
+
+                const [newFolderFiles, oldFolderFiles] = await Promise.all([
+                    listFolderFiles(currentFolder),
+                    listFolderFiles(parsed.folder),
+                ]);
+
+                if (newFolderFiles.has(parsed.fileName) && !oldFolderFiles.has(parsed.fileName)) {
+                    obj[key] = `/user/images/${encodeURIComponent(currentFolder)}/${encodeURIComponent(parsed.fileName)}`;
+                    chatLinksFixed++;
+                }
+            };
+
+            const maybeFixExtra = async (extra) => {
+                if (!extra || typeof extra !== 'object') return;
+                await maybeFixField(extra, 'image');
+                if (Array.isArray(extra.media)) {
+                    for (const item of extra.media) {
+                        await maybeFixField(item, 'url');
+                    }
+                }
+            };
+
+            for (const message of messages) {
+                // Every message is a candidate, not just character-authored ones: the
+                // manual attach-a-file flow saves under the character's folder regardless
+                // of who the message ends up being from. See function doc comment.
+                if (!message) continue;
+                await maybeFixExtra(message.extra);
+                const swipeInfos = Array.isArray(message.swipe_info) ? message.swipe_info : [];
+                for (const swipeInfo of swipeInfos) {
+                    await maybeFixExtra(swipeInfo?.extra);
+                }
+            }
+
+            if (chatLinksFixed === 0) continue;
+
+            try {
+                const saveResp = await apiRequest(ENDPOINTS.CHATS_SAVE, 'POST', {
+                    ch_name: char.name,
+                    file_name: fileName,
+                    avatar_url: char.avatar,
+                    chat: messages,
+                });
+                if (saveResp.ok) {
+                    result.chatsFixed++;
+                    result.linksFixed += chatLinksFixed;
+                } else {
+                    const errorText = await saveResp.text().catch(() => 'Unknown error');
+                    result.errors.push({ character: char.name, chat: fileName, error: `Save failed: ${errorText}` });
+                }
+            } catch (error) {
+                result.errors.push({ character: char.name, chat: fileName, error: error.message });
+            }
+        }
+    }
+
     return result;
 }
 
